@@ -1,0 +1,9 @@
+test_instructions.md
+submission/
+
+.venv/
+data/
+logs/
+_pytest_cache/
+__pycache__/
+*.pyc
