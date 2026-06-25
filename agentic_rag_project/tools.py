@@ -147,45 +147,38 @@ class SQLQueryTool(BaseTool):
             conn.commit()
             conn.close()
     
-    def execute(self, query: str = "", **kwargs) -> Dict:
+    def execute(self, query: str = "", approved: bool = False, **kwargs) -> Dict:
         """Execute SQL query."""
         try:
-            # Basic SQL injection prevention
-            dangerous_keywords = ["DROP", "DELETE", "ALTER", "TRUNCATE", "UPDATE"]
             query_upper = query.upper().strip()
-            for kw in dangerous_keywords:
-                if kw in query_upper and kw != "DELETE":
-                    return {
-                        "status": "blocked",
-                        "tool": self.name,
-                        "error": f"Dangerous SQL keyword '{kw}' detected. Operation blocked by guardrails.",
-                    }
+            if not approved:
+                return {
+                    "status": "blocked",
+                    "tool": self.name,
+                    "error": "SQL execution requires Human-in-the-Loop approval.",
+                }
+            if not query_upper.startswith("SELECT"):
+                return {
+                    "status": "blocked",
+                    "tool": self.name,
+                    "error": "Only SELECT queries are allowed by default.",
+                }
             
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             cursor.execute(query)
             
-            if query_upper.startswith("SELECT"):
-                columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                rows = cursor.fetchall()
-                conn.close()
-                return {
-                    "status": "success",
-                    "tool": self.name,
-                    "query": query,
-                    "columns": columns,
-                    "rows": rows,
-                    "row_count": len(rows),
-                }
-            else:
-                conn.commit()
-                conn.close()
-                return {
-                    "status": "success",
-                    "tool": self.name,
-                    "query": query,
-                    "message": "Query executed successfully.",
-                }
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            rows = cursor.fetchall()
+            conn.close()
+            return {
+                "status": "success",
+                "tool": self.name,
+                "query": query,
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+            }
         except Exception as e:
             return {"status": "error", "tool": self.name, "error": str(e)}
 
@@ -206,7 +199,7 @@ class FileOperationsTool(BaseTool):
     requires_hitl = False  # Read is safe; write would require HITL
     
     def __init__(self, base_dir: str = "data/documents"):
-        self.base_dir = base_dir
+        self.base_dir = os.path.abspath(base_dir)
         os.makedirs(base_dir, exist_ok=True)
     
     def execute(self, action: str = "list", path: str = "", **kwargs) -> Dict:
@@ -223,6 +216,7 @@ class FileOperationsTool(BaseTool):
     
     def _list_directory(self, directory: str) -> Dict:
         """List directory contents."""
+        directory = self._resolve_path(directory)
         if not os.path.exists(directory):
             return {"status": "error", "tool": self.name, "error": f"Directory not found: {directory}"}
         
@@ -245,6 +239,7 @@ class FileOperationsTool(BaseTool):
     
     def _read_file(self, file_path: str) -> Dict:
         """Read file contents."""
+        file_path = self._resolve_path(file_path)
         if not os.path.exists(file_path):
             return {"status": "error", "tool": self.name, "error": f"File not found: {file_path}"}
         
@@ -258,6 +253,18 @@ class FileOperationsTool(BaseTool):
             "content": content,
             "size": os.path.getsize(file_path),
         }
+
+    def _resolve_path(self, path: str) -> str:
+        if not path:
+            candidate = self.base_dir
+        elif os.path.isabs(path):
+            candidate = os.path.abspath(path)
+        else:
+            candidate = os.path.abspath(os.path.join(self.base_dir, path))
+        base = os.path.abspath(self.base_dir)
+        if os.path.commonpath([candidate, base]) != base:
+            raise PermissionError(f"Path outside allowed document directory: {path}")
+        return candidate
 
 
 # ─────────────────────────────────────────────
@@ -286,7 +293,7 @@ class CalculatorTool(BaseTool):
                     "error": "Expression contains disallowed characters.",
                 }
             
-            result = eval(expression)  # Safe due to char validation
+            result = eval(expression, {"__builtins__": {}}, {})  # Safe due to char validation
             return {
                 "status": "success",
                 "tool": self.name,
@@ -377,12 +384,18 @@ class ToolRegistry:
         """Get a tool by name."""
         return self.tools.get(name)
     
-    def execute_tool(self, name: str, **kwargs) -> Dict:
+    def execute_tool(self, name: str, approved: bool = False, **kwargs) -> Dict:
         """Execute a tool by name."""
         tool = self.get_tool(name)
         if not tool:
             return {"status": "error", "error": f"Tool '{name}' not found."}
-        return tool.execute(**kwargs)
+        if tool.requires_hitl and not approved:
+            return {
+                "status": "blocked",
+                "tool": name,
+                "error": f"Tool '{name}' requires Human-in-the-Loop approval.",
+            }
+        return tool.execute(approved=approved, **kwargs)
     
     def get_all_schemas(self) -> List[Dict]:
         """Get schemas for all registered tools (for function calling)."""

@@ -1,826 +1,476 @@
-"""
-The Retrieval & Memory Engine Module
+"""Retrieval and memory engine for the Agentic RAG project.
 
-Implements:
-  - Vector Database (ChromaDB / FAISS)
-  - Embeddings (sentence-transformers)
-  - Semantic Search (dense vector search)
-  - Hybrid Search (BM25 keyword + semantic vector)
-  - Hierarchical Retrieval / Parent-Document Retrieval
-  - Re-ranking (cross-encoder secondary pass)
-  - Metadata Filtering (RBAC-based)
-  - Semantic Router (intent-based query routing)
-  - Context Window management
-  - Graph RAG (entity-relationship retrieval)
+This module deliberately keeps a production-shaped API while using local,
+deterministic implementations by default:
+  - hashing embeddings for semantic search
+  - BM25 keyword retrieval
+  - hybrid score fusion
+  - parent-document lookup
+  - heuristic reranking
+  - semantic routing
+  - a small knowledge graph for Graph RAG context
+  - context compression and lost-in-the-middle mitigation
+
+The contracts can be backed by Chroma/Qdrant/Pinecone, cross-encoders, or
+domain-tuned embeddings later without changing the agent graph.
 """
 
+from __future__ import annotations
+
+import json
+import math
 import os
 import re
-import math
-import json
-import hashlib
-import logging
-from typing import List, Dict, Optional, Tuple, Any
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from ingestion import DocumentChunk, IngestedDocument
-
-logger = logging.getLogger(__name__)
+from ingestion import ChunkingEngine, DocumentChunk
 
 
-# ─────────────────────────────────────────────
-# Embeddings
-# ─────────────────────────────────────────────
+TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _tokens(text: str) -> List[str]:
+    return [match.group(0).lower() for match in TOKEN_RE.finditer(text or "")]
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    if not left or not right:
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
 
 class EmbeddingEngine:
+    """Local deterministic embeddings.
+
+    A hashing vectorizer is not a replacement for a tuned embedding model, but
+    it gives the project a reliable offline semantic-search contract. Swap this
+    class for Ollama embeddings, sentence-transformers, or a managed embedding
+    API when accuracy matters more than air-gapped portability.
     """
-    Embeddings:
-    Numerical vectors that capture the semantic meaning of text.
-    Uses sentence-transformers if available, otherwise a TF-IDF fallback.
-    Supports Embedding Fine-Tuning awareness.
-    """
-    
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", dimension: int = 384):
-        self.model_name = model_name
+
+    def __init__(self, dimension: int = 256):
         self.dimension = dimension
-        self._model = None
-        self._use_transformer = False
-        self._init_model()
-    
-    def _init_model(self):
-        """Initialize the embedding model."""
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer(self.model_name)
-            self._use_transformer = True
-            self.dimension = self._model.get_sentence_embedding_dimension()
-            logger.info(f"Loaded sentence-transformer: {self.model_name} (dim={self.dimension})")
-        except ImportError:
-            logger.warning("sentence-transformers not installed. Using TF-IDF fallback.")
-            self._use_transformer = False
-    
-    def embed(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts."""
-        if self._use_transformer:
-            embeddings = self._model.encode(texts, show_progress_bar=False)
-            return embeddings.tolist()
-        else:
-            return [self._tfidf_embed(text) for text in texts]
-    
+
     def embed_single(self, text: str) -> List[float]:
-        """Generate embedding for a single text."""
-        return self.embed([text])[0]
-    
-    def _tfidf_embed(self, text: str) -> List[float]:
-        """Simple TF-IDF based embedding fallback."""
-        words = text.lower().split()
-        word_counts = Counter(words)
-        total = len(words) or 1
-        
-        # Create a deterministic embedding from word hashes
-        embedding = [0.0] * self.dimension
-        for word, count in word_counts.items():
-            tf = count / total
-            idx = int(hashlib.md5(word.encode()).hexdigest(), 16) % self.dimension
-            embedding[idx] += tf
-        
-        # Normalize
-        norm = math.sqrt(sum(x * x for x in embedding)) or 1
-        return [x / norm for x in embedding]
+        vector = [0.0] * self.dimension
+        for token in _tokens(text):
+            idx = hash(token) % self.dimension
+            vector[idx] += 1.0
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm:
+            vector = [value / norm for value in vector]
+        return vector
 
+    def embed_many(self, texts: Iterable[str]) -> List[List[float]]:
+        return [self.embed_single(text) for text in texts]
 
-# ─────────────────────────────────────────────
-# BM25 Keyword Search
-# ─────────────────────────────────────────────
-
-class BM25Retriever:
-    """
-    BM25 Keyword Search:
-    Traditional keyword-based retrieval using the BM25 algorithm.
-    Part of Hybrid Search.
-    """
-    
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
-        self.k1 = k1
-        self.b = b
-        self.corpus: List[DocumentChunk] = []
-        self.tokenized_corpus: List[List[str]] = []
-        self.doc_freqs: Dict[str, int] = {}
-        self.avg_dl: float = 0
-        self.N: int = 0
-    
-    def index(self, chunks: List[DocumentChunk]):
-        """Index chunks for BM25 search."""
-        self.corpus = chunks
-        self.tokenized_corpus = [self._tokenize(c.content) for c in chunks]
-        self.N = len(chunks)
-        
-        # Calculate document frequencies
-        self.doc_freqs = {}
-        for tokens in self.tokenized_corpus:
-            unique_tokens = set(tokens)
-            for token in unique_tokens:
-                self.doc_freqs[token] = self.doc_freqs.get(token, 0) + 1
-        
-        # Average document length
-        total_len = sum(len(t) for t in self.tokenized_corpus)
-        self.avg_dl = total_len / self.N if self.N > 0 else 0
-        
-        logger.info(f"BM25: Indexed {self.N} chunks, vocabulary size: {len(self.doc_freqs)}")
-    
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[DocumentChunk, float]]:
-        """Search using BM25 scoring."""
-        query_tokens = self._tokenize(query)
-        scores = []
-        
-        for i, doc_tokens in enumerate(self.tokenized_corpus):
-            score = self._bm25_score(query_tokens, doc_tokens, len(doc_tokens))
-            scores.append((self.corpus[i], score))
-        
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_k]
-    
-    def _bm25_score(self, query_tokens: List[str], doc_tokens: List[str],
-                     doc_len: int) -> float:
-        """Calculate BM25 score for a single document."""
-        score = 0.0
-        doc_token_counts = Counter(doc_tokens)
-        
-        for token in query_tokens:
-            if token not in doc_token_counts:
-                continue
-            
-            tf = doc_token_counts[token]
-            df = self.doc_freqs.get(token, 0)
-            
-            # IDF
-            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1)
-            
-            # TF normalization
-            tf_norm = (tf * (self.k1 + 1)) / (
-                tf + self.k1 * (1 - self.b + self.b * doc_len / (self.avg_dl or 1))
-            )
-            
-            score += idf * tf_norm
-        
-        return score
-    
-    def _tokenize(self, text: str) -> List[str]:
-        """Simple tokenization."""
-        return re.findall(r'\w+', text.lower())
-
-
-# ─────────────────────────────────────────────
-# Vector Store (Semantic Search)
-# ─────────────────────────────────────────────
 
 class VectorStore:
-    """
-    Vector Database & Semantic Search:
-    Stores numerical representations (embeddings) and performs
-    similarity search based on semantic meaning.
-    
-    Supports Vector Quantization for compression.
-    """
-    
+    """Small local vector database with metadata filtering and parent lookup."""
+
     def __init__(self, embedding_engine: EmbeddingEngine, persist_dir: str = "data/vectordb"):
         self.embedding_engine = embedding_engine
         self.persist_dir = persist_dir
-        self.chunks: List[DocumentChunk] = []
-        self.embeddings: List[List[float]] = []
-        self.parent_chunks: Dict[str, DocumentChunk] = {}  # For hierarchical retrieval
-        os.makedirs(persist_dir, exist_ok=True)
-    
-    def add_chunks(self, chunks: List[DocumentChunk],
-                    parent_chunks: Optional[List[DocumentChunk]] = None):
-        """Add chunks and their embeddings to the store."""
-        if not chunks:
-            return
-        
-        texts = [c.content for c in chunks]
-        new_embeddings = self.embedding_engine.embed(texts)
-        
-        self.chunks.extend(chunks)
-        self.embeddings.extend(new_embeddings)
-        
-        # Store parent chunks for hierarchical retrieval
-        if parent_chunks:
-            for pc in parent_chunks:
-                self.parent_chunks[pc.chunk_id] = pc
-        
-        logger.info(f"VectorStore: Added {len(chunks)} chunks (total: {len(self.chunks)})")
-    
-    def search(self, query: str, top_k: int = 5,
-               metadata_filter: Optional[Dict] = None) -> List[Tuple[DocumentChunk, float]]:
-        """
-        Semantic Search:
-        Search by meaning of the query rather than keyword matches.
-        Supports Metadata Filtering.
-        """
-        if not self.chunks:
-            return []
-        
-        query_embedding = self.embedding_engine.embed_single(query)
-        
-        # Calculate cosine similarities
-        results = []
-        for i, (chunk, emb) in enumerate(zip(self.chunks, self.embeddings)):
-            # Apply metadata filtering
-            if metadata_filter and not self._matches_filter(chunk.metadata, metadata_filter):
+        self.chunks: Dict[str, DocumentChunk] = {}
+        self.parent_chunks: Dict[str, DocumentChunk] = {}
+        self.vectors: Dict[str, List[float]] = {}
+        os.makedirs(self.persist_dir, exist_ok=True)
+
+    def add_chunks(
+        self,
+        chunks: Sequence[DocumentChunk],
+        parent_chunks: Optional[Sequence[DocumentChunk]] = None,
+    ) -> None:
+        for parent in parent_chunks or []:
+            self.parent_chunks[parent.chunk_id] = parent
+
+        for chunk in chunks:
+            self.chunks[chunk.chunk_id] = chunk
+            self.vectors[chunk.chunk_id] = self.embedding_engine.embed_single(chunk.content)
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[DocumentChunk, float]]:
+        query_vector = self.embedding_engine.embed_single(query)
+        scored: List[Tuple[DocumentChunk, float]] = []
+        for chunk_id, chunk in self.chunks.items():
+            if not self._matches_filter(chunk.metadata, metadata_filter):
                 continue
-            
-            similarity = self._cosine_similarity(query_embedding, emb)
-            results.append((chunk, similarity))
-        
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
-    
-    def _matches_filter(self, metadata: Dict, filter_dict: Dict) -> bool:
-        """
-        Metadata Filtering:
-        Check if chunk metadata matches the filter criteria.
-        """
-        for key, condition in filter_dict.items():
-            value = metadata.get(key)
-            if value is None:
-                continue  # Skip if metadata key doesn't exist
-            
-            if isinstance(condition, dict):
-                for op, target in condition.items():
-                    if op == "$lte" and not (value <= target):
-                        return False
-                    elif op == "$gte" and not (value >= target):
-                        return False
-                    elif op == "$eq" and value != target:
-                        return False
-                    elif op == "$in" and value not in target:
-                        return False
-            elif value != condition:
-                return False
-        
-        return True
-    
-    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculate cosine similarity between two vectors."""
-        dot = sum(a * b for a, b in zip(vec1, vec2))
-        norm1 = math.sqrt(sum(a * a for a in vec1)) or 1
-        norm2 = math.sqrt(sum(b * b for b in vec2)) or 1
-        return dot / (norm1 * norm2)
-    
-    def get_parent_chunk(self, child_chunk: DocumentChunk) -> Optional[DocumentChunk]:
-        """
-        Hierarchical Retrieval / Parent-Document Retrieval:
-        Given a child chunk, retrieve the full parent document.
-        """
-        parent_id = child_chunk.parent_chunk_id or child_chunk.metadata.get("parent_chunk_id")
-        if parent_id and parent_id in self.parent_chunks:
-            return self.parent_chunks[parent_id]
-        return None
-    
-    def save(self):
-        """Persist the vector store to disk."""
-        data = {
-            "chunks": [
-                {
-                    "content": c.content,
-                    "metadata": c.metadata,
-                    "chunk_id": c.chunk_id,
-                    "parent_chunk_id": c.parent_chunk_id,
-                    "source_file": c.source_file,
-                    "chunk_index": c.chunk_index,
-                }
-                for c in self.chunks
-            ],
-            "embeddings": self.embeddings,
-            "parent_chunks": {
-                pid: {
-                    "content": pc.content,
-                    "metadata": pc.metadata,
-                    "chunk_id": pc.chunk_id,
-                    "source_file": pc.source_file,
-                }
-                for pid, pc in self.parent_chunks.items()
-            },
+            score = _cosine(query_vector, self.vectors.get(chunk_id, []))
+            if score > 0:
+                scored.append((self.get_parent_chunk(chunk) or chunk, score))
+        return _dedupe_and_sort(scored, top_k)
+
+    def get_parent_chunk(self, chunk_or_id: Any) -> Optional[DocumentChunk]:
+        if isinstance(chunk_or_id, DocumentChunk):
+            parent_id = chunk_or_id.parent_chunk_id or chunk_or_id.metadata.get("parent_chunk_id")
+        else:
+            chunk = self.chunks.get(str(chunk_or_id))
+            parent_id = chunk.parent_chunk_id if chunk else str(chunk_or_id)
+        if not parent_id:
+            return None
+        return self.parent_chunks.get(parent_id)
+
+    def persist(self) -> str:
+        path = os.path.join(self.persist_dir, "vector_store.json")
+        payload = {
+            "chunks": [asdict(chunk) for chunk in self.chunks.values()],
+            "parents": [asdict(chunk) for chunk in self.parent_chunks.values()],
+            "vectors": self.vectors,
         }
-        path = os.path.join(self.persist_dir, "vectorstore.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        logger.info(f"VectorStore: Saved to {path}")
-    
-    def load(self) -> bool:
-        """Load vector store from disk."""
-        path = os.path.join(self.persist_dir, "vectorstore.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        return path
+
+    def load(self) -> None:
+        path = os.path.join(self.persist_dir, "vector_store.json")
         if not os.path.exists(path):
-            return False
-        
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        self.chunks = [
-            DocumentChunk(
-                content=c["content"],
-                metadata=c["metadata"],
-                chunk_id=c["chunk_id"],
-                parent_chunk_id=c.get("parent_chunk_id", ""),
-                source_file=c.get("source_file", ""),
-                chunk_index=c.get("chunk_index", 0),
-            )
-            for c in data.get("chunks", [])
-        ]
-        self.embeddings = data.get("embeddings", [])
-        
-        for pid, pc_data in data.get("parent_chunks", {}).items():
-            self.parent_chunks[pid] = DocumentChunk(
-                content=pc_data["content"],
-                metadata=pc_data["metadata"],
-                chunk_id=pc_data["chunk_id"],
-                source_file=pc_data.get("source_file", ""),
-            )
-        
-        logger.info(f"VectorStore: Loaded {len(self.chunks)} chunks from {path}")
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.chunks = {
+            item["chunk_id"]: DocumentChunk(**item) for item in payload.get("chunks", [])
+        }
+        self.parent_chunks = {
+            item["chunk_id"]: DocumentChunk(**item) for item in payload.get("parents", [])
+        }
+        self.vectors = {key: list(value) for key, value in payload.get("vectors", {}).items()}
+
+    def _matches_filter(self, metadata: Dict[str, Any], metadata_filter: Optional[Dict[str, Any]]) -> bool:
+        if not metadata_filter:
+            return True
+        for key, expected in metadata_filter.items():
+            actual = metadata.get(key, 0 if key == "security_clearance" else None)
+            if isinstance(expected, dict):
+                if "$lte" in expected and not (actual <= expected["$lte"]):
+                    return False
+                if "$gte" in expected and not (actual >= expected["$gte"]):
+                    return False
+                if "$in" in expected and actual not in expected["$in"]:
+                    return False
+                if "$eq" in expected and actual != expected["$eq"]:
+                    return False
+            elif actual != expected:
+                return False
         return True
 
 
-# ─────────────────────────────────────────────
-# Re-ranking
-# ─────────────────────────────────────────────
+class BM25Retriever:
+    """BM25 keyword retriever with metadata filtering."""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.chunks: List[DocumentChunk] = []
+        self.doc_tokens: List[List[str]] = []
+        self.doc_freqs: Counter[str] = Counter()
+        self.avg_doc_len = 0.0
+
+    def index(self, chunks: Sequence[DocumentChunk]) -> None:
+        self.chunks = list(chunks)
+        self.doc_tokens = [_tokens(chunk.content) for chunk in self.chunks]
+        self.doc_freqs = Counter()
+        for token_set in (set(tokens) for tokens in self.doc_tokens):
+            self.doc_freqs.update(token_set)
+        self.avg_doc_len = (
+            sum(len(tokens) for tokens in self.doc_tokens) / len(self.doc_tokens)
+            if self.doc_tokens
+            else 0.0
+        )
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[DocumentChunk, float]]:
+        query_terms = _tokens(query)
+        if not query_terms or not self.chunks:
+            return []
+
+        results: List[Tuple[DocumentChunk, float]] = []
+        total_docs = len(self.chunks)
+        for chunk, tokens in zip(self.chunks, self.doc_tokens):
+            if not VectorStore._matches_filter(self, chunk.metadata, metadata_filter):
+                continue
+            term_counts = Counter(tokens)
+            score = 0.0
+            doc_len = len(tokens) or 1
+            for term in query_terms:
+                if term_counts[term] == 0:
+                    continue
+                idf = math.log(1 + (total_docs - self.doc_freqs[term] + 0.5) / (self.doc_freqs[term] + 0.5))
+                numerator = term_counts[term] * (self.k1 + 1)
+                denominator = term_counts[term] + self.k1 * (
+                    1 - self.b + self.b * doc_len / (self.avg_doc_len or 1)
+                )
+                score += idf * numerator / denominator
+            if score > 0:
+                results.append((chunk, score))
+        return _dedupe_and_sort(results, top_k)
+
 
 class ReRanker:
-    """
-    Re-ranking:
-    Uses a secondary algorithm to evaluate and re-order retrieved context
-    so the most relevant information is fed to the LLM.
-    
-    Implements cross-encoder scoring simulation.
-    """
-    
-    def __init__(self, model_type: str = "cross-encoder"):
-        self.model_type = model_type
-        self._cross_encoder = None
-        self._init_model()
-    
-    def _init_model(self):
-        """Initialize cross-encoder model if available."""
-        try:
-            from sentence_transformers import CrossEncoder
-            self._cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-            logger.info("Re-ranker: Loaded cross-encoder model")
-        except (ImportError, Exception) as e:
-            logger.info(f"Cross-encoder not available ({e}). Using keyword overlap re-ranking.")
-    
-    def rerank(self, query: str, results: List[Tuple[DocumentChunk, float]],
-               top_k: int = 5) -> List[Tuple[DocumentChunk, float]]:
-        """Re-rank results using cross-encoder or keyword overlap."""
-        if not results:
-            return []
-        
-        if self._cross_encoder:
-            return self._rerank_cross_encoder(query, results, top_k)
-        else:
-            return self._rerank_keyword_overlap(query, results, top_k)
-    
-    def _rerank_cross_encoder(self, query: str,
-                               results: List[Tuple[DocumentChunk, float]],
-                               top_k: int) -> List[Tuple[DocumentChunk, float]]:
-        """Re-rank using cross-encoder model."""
-        pairs = [(query, chunk.content) for chunk, _ in results]
-        scores = self._cross_encoder.predict(pairs)
-        
-        reranked = [
-            (chunk, float(score))
-            for (chunk, _), score in zip(results, scores)
-        ]
-        reranked.sort(key=lambda x: x[1], reverse=True)
-        return reranked[:top_k]
-    
-    def _rerank_keyword_overlap(self, query: str,
-                                 results: List[Tuple[DocumentChunk, float]],
-                                 top_k: int) -> List[Tuple[DocumentChunk, float]]:
-        """Re-rank using keyword overlap (fallback)."""
-        query_tokens = set(re.findall(r'\w+', query.lower()))
-        
-        reranked = []
-        for chunk, original_score in results:
-            doc_tokens = set(re.findall(r'\w+', chunk.content.lower()))
-            overlap = len(query_tokens & doc_tokens) / (len(query_tokens) or 1)
-            # Combine original score with overlap score
-            combined = 0.6 * original_score + 0.4 * overlap
-            reranked.append((chunk, combined))
-        
-        reranked.sort(key=lambda x: x[1], reverse=True)
-        return reranked[:top_k]
+    """Heuristic reranker that can be replaced by a cross-encoder later."""
 
+    def rerank(
+        self,
+        query: str,
+        results: Sequence[Tuple[DocumentChunk, float]],
+        top_k: int = 5,
+    ) -> List[Tuple[DocumentChunk, float]]:
+        query_terms = set(_tokens(query))
+        reranked: List[Tuple[DocumentChunk, float]] = []
+        for chunk, score in results:
+            content_terms = set(_tokens(chunk.content))
+            overlap = len(query_terms & content_terms) / max(len(query_terms), 1)
+            citation_boost = 0.03 if chunk.source_file else 0.0
+            reranked.append((chunk, score + overlap + citation_boost))
+        return _dedupe_and_sort(reranked, top_k)
 
-# ─────────────────────────────────────────────
-# Hybrid Search (BM25 + Semantic)
-# ─────────────────────────────────────────────
 
 class HybridSearchEngine:
-    """
-    Hybrid Search:
-    Combining keyword search (BM25) and vector search to ensure
-    both precision and contextual relevance.
-    
-    Uses Ensemble Retrieval with configurable weights.
-    """
-    
-    def __init__(self, vector_store: VectorStore, bm25: BM25Retriever,
-                 reranker: ReRanker, bm25_weight: float = 0.4,
-                 semantic_weight: float = 0.6):
+    """Hybrid keyword + vector retrieval with score normalization."""
+
+    def __init__(
+        self,
+        vector_store: VectorStore,
+        bm25: BM25Retriever,
+        reranker: Optional[ReRanker] = None,
+        vector_weight: float = 0.6,
+        keyword_weight: float = 0.4,
+    ):
         self.vector_store = vector_store
         self.bm25 = bm25
-        self.reranker = reranker
-        self.bm25_weight = bm25_weight
-        self.semantic_weight = semantic_weight
-    
-    def search(self, query: str, top_k: int = 5,
-               metadata_filter: Optional[Dict] = None,
-               use_reranking: bool = True,
-               use_hierarchical: bool = True) -> List[Tuple[DocumentChunk, float]]:
-        """
-        Perform hybrid search combining BM25 and semantic results.
-        Optionally applies re-ranking and hierarchical retrieval.
-        """
-        # 1. BM25 keyword search
-        bm25_results = self.bm25.search(query, top_k=top_k * 2)
-        
-        # 2. Semantic vector search with metadata filtering
-        semantic_results = self.vector_store.search(query, top_k=top_k * 2,
-                                                      metadata_filter=metadata_filter)
-        
-        # 3. Normalize and combine scores
-        combined = self._fuse_results(bm25_results, semantic_results)
-        
-        # 4. Re-ranking
-        if use_reranking and combined:
-            combined = self.reranker.rerank(query, combined, top_k=top_k)
-        else:
-            combined = combined[:top_k]
-        
-        # 5. Hierarchical retrieval: replace child chunks with parent documents
-        if use_hierarchical:
-            combined = self._expand_to_parents(combined)
-        
-        return combined
-    
-    def _fuse_results(self, bm25_results: List[Tuple[DocumentChunk, float]],
-                       semantic_results: List[Tuple[DocumentChunk, float]]) -> List[Tuple[DocumentChunk, float]]:
-        """Fuse results from BM25 and semantic search using Reciprocal Rank Fusion."""
-        k = 60  # RRF constant
-        scores: Dict[str, float] = {}
-        chunk_map: Dict[str, DocumentChunk] = {}
-        
-        # BM25 scores
-        for rank, (chunk, score) in enumerate(bm25_results):
-            cid = chunk.chunk_id
-            rrf_score = self.bm25_weight / (k + rank + 1)
-            scores[cid] = scores.get(cid, 0) + rrf_score
-            chunk_map[cid] = chunk
-        
-        # Semantic scores
-        for rank, (chunk, score) in enumerate(semantic_results):
-            cid = chunk.chunk_id
-            rrf_score = self.semantic_weight / (k + rank + 1)
-            scores[cid] = scores.get(cid, 0) + rrf_score
-            chunk_map[cid] = chunk
-        
-        # Sort by combined RRF score
-        fused = [(chunk_map[cid], score) for cid, score in scores.items()]
-        fused.sort(key=lambda x: x[1], reverse=True)
-        
-        return fused
-    
-    def _expand_to_parents(self, results: List[Tuple[DocumentChunk, float]]) -> List[Tuple[DocumentChunk, float]]:
-        """
-        Hierarchical Retrieval / Parent-Document Retrieval:
-        Replace child chunks with their parent documents for richer context.
-        """
-        expanded = []
-        seen_parent_ids = set()
-        
-        for chunk, score in results:
-            parent = self.vector_store.get_parent_chunk(chunk)
-            if parent and parent.chunk_id not in seen_parent_ids:
-                expanded.append((parent, score))
-                seen_parent_ids.add(parent.chunk_id)
-            else:
-                expanded.append((chunk, score))
-        
-        return expanded
+        self.reranker = reranker or ReRanker()
+        self.vector_weight = vector_weight
+        self.keyword_weight = keyword_weight
 
+    @classmethod
+    def from_chunks(
+        cls,
+        chunks: Sequence[DocumentChunk],
+        parent_chunks: Optional[Sequence[DocumentChunk]] = None,
+        embedding_engine: Optional[EmbeddingEngine] = None,
+        persist_dir: str = "data/vectordb",
+    ) -> "HybridSearchEngine":
+        embeddings = embedding_engine or EmbeddingEngine()
+        vector_store = VectorStore(embeddings, persist_dir=persist_dir)
+        vector_store.add_chunks(chunks, parent_chunks)
+        bm25 = BM25Retriever()
+        bm25.index(chunks)
+        return cls(vector_store=vector_store, bm25=bm25)
 
-# ─────────────────────────────────────────────
-# Semantic Router
-# ─────────────────────────────────────────────
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[DocumentChunk, float]]:
+        vector_results = self.vector_store.search(query, top_k=top_k * 2, metadata_filter=metadata_filter)
+        keyword_results = self.bm25.search(query, top_k=top_k * 2, metadata_filter=metadata_filter)
+
+        fused: Dict[str, Tuple[DocumentChunk, float]] = {}
+        for chunk, score in _normalize(vector_results):
+            fused[chunk.chunk_id] = (chunk, fused.get(chunk.chunk_id, (chunk, 0.0))[1] + score * self.vector_weight)
+        for chunk, score in _normalize(keyword_results):
+            fused[chunk.chunk_id] = (chunk, fused.get(chunk.chunk_id, (chunk, 0.0))[1] + score * self.keyword_weight)
+
+        results = list(fused.values())
+        return self.reranker.rerank(query, results, top_k=top_k)
+
 
 class SemanticRouter:
-    """
-    Semantic Router:
-    An intelligent mechanism that analyzes the user's intent to
-    direct the query to the correct data source or agent.
-    """
-    
-    def __init__(self, embedding_engine: EmbeddingEngine):
-        self.embedding_engine = embedding_engine
-        self.routes: Dict[str, Dict] = {}
-        self.route_embeddings: Dict[str, List[float]] = {}
-    
-    def add_route(self, route_name: str, description: str,
-                   sample_queries: List[str], handler: str = "default"):
-        """Register a semantic route with sample queries."""
-        self.routes[route_name] = {
+    """Intent router based on route exemplars and embedding similarity."""
+
+    def __init__(self, embedding_engine: Optional[EmbeddingEngine] = None):
+        self.embedding_engine = embedding_engine or EmbeddingEngine()
+        self.routes: Dict[str, Dict[str, Any]] = {}
+
+    def add_route(self, name: str, description: str, examples: Sequence[str]) -> None:
+        route_text = " ".join([description, *examples])
+        self.routes[name] = {
             "description": description,
-            "sample_queries": sample_queries,
-            "handler": handler,
+            "examples": list(examples),
+            "embedding": self.embedding_engine.embed_single(route_text),
         }
-        
-        # Create an averaged embedding from sample queries
-        embeddings = self.embedding_engine.embed(sample_queries)
-        avg_embedding = [
-            sum(e[i] for e in embeddings) / len(embeddings)
-            for i in range(len(embeddings[0]))
-        ]
-        self.route_embeddings[route_name] = avg_embedding
-        
-        logger.info(f"SemanticRouter: Added route '{route_name}' with {len(sample_queries)} samples")
-    
+
     def route(self, query: str) -> Tuple[str, float]:
-        """
-        Determine which route best matches the query.
-        Returns (route_name, confidence_score).
-        """
         if not self.routes:
-            return "default", 0.0
-        
+            return "general", 0.0
         query_embedding = self.embedding_engine.embed_single(query)
-        
-        best_route = "default"
+        best_name = "general"
         best_score = -1.0
-        
-        for route_name, route_embedding in self.route_embeddings.items():
-            score = self._cosine_similarity(query_embedding, route_embedding)
+        for name, route in self.routes.items():
+            score = _cosine(query_embedding, route["embedding"])
             if score > best_score:
+                best_name = name
                 best_score = score
-                best_route = route_name
-        
-        logger.info(f"SemanticRouter: Query routed to '{best_route}' (score={best_score:.4f})")
-        return best_route, best_score
-    
-    def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        dot = sum(a * b for a, b in zip(vec1, vec2))
-        norm1 = math.sqrt(sum(a * a for a in vec1)) or 1
-        norm2 = math.sqrt(sum(b * b for b in vec2)) or 1
-        return dot / (norm1 * norm2)
+        return best_name, max(best_score, 0.0)
 
-
-# ─────────────────────────────────────────────
-# Graph RAG
-# ─────────────────────────────────────────────
 
 class KnowledgeGraph:
-    """
-    Graph RAG:
-    Utilizes knowledge graphs alongside vector databases to retrieve
-    highly interconnected data and relationships.
-    
-    Implements a simple in-memory entity-relationship graph.
-    """
-    
+    """Small entity-to-chunk graph for Graph RAG context."""
+
     def __init__(self):
-        self.entities: Dict[str, Dict] = {}       # entity_id -> {name, type, properties}
-        self.relations: List[Dict] = []            # [{source, target, relation, properties}]
-        self.adjacency: Dict[str, List[str]] = defaultdict(list)  # entity_id -> [related entity_ids]
-    
-    def add_entity(self, entity_id: str, name: str, entity_type: str,
-                    properties: Dict = None):
-        """Add an entity node to the graph."""
-        self.entities[entity_id] = {
-            "name": name,
-            "type": entity_type,
-            "properties": properties or {},
-        }
-    
-    def add_relation(self, source_id: str, target_id: str, relation: str,
-                      properties: Dict = None):
-        """Add a relationship edge between entities."""
-        self.relations.append({
-            "source": source_id,
-            "target": target_id,
-            "relation": relation,
-            "properties": properties or {},
-        })
-        self.adjacency[source_id].append(target_id)
-        self.adjacency[target_id].append(source_id)
-    
-    def extract_entities_from_text(self, text: str, chunk_id: str = "") -> List[str]:
-        """
-        Simple entity extraction using regex patterns.
-        Extracts capitalized phrases as potential entities.
-        """
-        # Find capitalized multi-word phrases
-        entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        
-        entity_ids = []
-        for entity_name in set(entities):
-            eid = hashlib.md5(entity_name.encode()).hexdigest()[:8]
-            if eid not in self.entities:
-                self.add_entity(eid, entity_name, "extracted",
-                               {"source_chunk": chunk_id})
-            entity_ids.append(eid)
-        
-        # Create co-occurrence relations
-        for i, eid1 in enumerate(entity_ids):
-            for eid2 in entity_ids[i + 1:]:
-                self.add_relation(eid1, eid2, "co_occurs_with",
-                                   {"source_chunk": chunk_id})
-        
-        return entity_ids
-    
-    def query_graph(self, entity_name: str, max_hops: int = 2) -> Dict:
-        """
-        Query the knowledge graph for an entity and its neighbors.
-        Returns a subgraph context.
-        """
-        # Find entity by name
-        target_id = None
-        for eid, info in self.entities.items():
-            if info["name"].lower() == entity_name.lower():
-                target_id = eid
-                break
-        
-        if not target_id:
-            return {"entities": [], "relations": []}
-        
-        # BFS to find related entities
-        visited = set()
-        queue = [(target_id, 0)]
-        result_entities = []
-        result_relations = []
-        
-        while queue:
-            current, depth = queue.pop(0)
-            if current in visited or depth > max_hops:
+        self.entities: Dict[str, Dict[str, Any]] = {}
+        self.edges: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.chunk_text: Dict[str, str] = {}
+
+    def extract_entities_from_text(self, text: str, chunk_id: str) -> List[str]:
+        candidates = re.findall(r"\b(?:[A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+){0,4}|[A-Z]{2,})\b", text)
+        entities = []
+        for candidate in candidates:
+            entity = candidate.strip()
+            if len(entity) < 3:
                 continue
-            visited.add(current)
-            
-            if current in self.entities:
-                result_entities.append(self.entities[current])
-            
-            for neighbor in self.adjacency.get(current, []):
-                if neighbor not in visited:
-                    queue.append((neighbor, depth + 1))
-        
-        # Collect relations between visited entities
-        for rel in self.relations:
-            if rel["source"] in visited and rel["target"] in visited:
-                result_relations.append(rel)
-        
-        return {"entities": result_entities, "relations": result_relations}
-    
-    def get_context_for_query(self, query: str, max_hops: int = 2) -> str:
-        """
-        Generate a text context from graph relationships for a query.
-        This is the Graph RAG retrieval step.
-        """
-        # Extract potential entities from the query
-        query_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
-        
-        context_parts = []
-        for entity_name in query_entities:
-            subgraph = self.query_graph(entity_name, max_hops)
-            if subgraph["entities"]:
-                for ent in subgraph["entities"]:
-                    context_parts.append(f"Entity: {ent['name']} (type: {ent['type']})")
-                for rel in subgraph["relations"][:10]:  # Limit relations
-                    src = self.entities.get(rel["source"], {}).get("name", "?")
-                    tgt = self.entities.get(rel["target"], {}).get("name", "?")
-                    context_parts.append(f"Relation: {src} --[{rel['relation']}]--> {tgt}")
-        
-        return "\n".join(context_parts) if context_parts else ""
+            entities.append(entity)
+            record = self.entities.setdefault(entity, {"mentions": 0, "chunks": set()})
+            record["mentions"] += 1
+            record["chunks"].add(chunk_id)
+        self.chunk_text[chunk_id] = text
 
+        unique_entities = list(dict.fromkeys(entities))
+        for left in unique_entities:
+            for right in unique_entities:
+                if left != right:
+                    self.edges[left][right] += 1
+        return unique_entities
 
-# ─────────────────────────────────────────────
-# Context Window Management
-# ─────────────────────────────────────────────
+    def add_chunk(self, chunk: DocumentChunk) -> None:
+        self.extract_entities_from_text(chunk.content, chunk.chunk_id)
+
+    def get_context_for_query(self, query: str, top_k: int = 5) -> str:
+        query_terms = set(_tokens(query))
+        matched_chunks: Counter[str] = Counter()
+        for entity, record in self.entities.items():
+            entity_terms = set(_tokens(entity))
+            if query_terms & entity_terms:
+                for chunk_id in record["chunks"]:
+                    matched_chunks[chunk_id] += record["mentions"]
+                for neighbor, weight in self.edges[entity].most_common(3):
+                    for chunk_id in self.entities.get(neighbor, {}).get("chunks", []):
+                        matched_chunks[chunk_id] += max(1, weight // 2)
+
+        parts = []
+        for chunk_id, _ in matched_chunks.most_common(top_k):
+            text = self.chunk_text.get(chunk_id, "")
+            if text:
+                parts.append(f"[GraphRAG:{chunk_id}] {text[:700]}")
+        return "\n".join(parts)
+
 
 class ContextWindowManager:
-    """
-    Context Window:
-    Manages the maximum amount of tokens an LLM can process.
-    Implements Context Compression / Prompt Compression and
-    Lost in the Middle Mitigation.
-    """
-    
+    """Context compression and lost-in-the-middle mitigation."""
+
     def __init__(self, max_tokens: int = 4096):
         self.max_tokens = max_tokens
-    
-    def estimate_tokens(self, text: str) -> int:
-        """Rough token estimation (1 token ≈ 4 chars)."""
-        return len(text) // 4
-    
-    def compress_context(self, chunks: List[Tuple[DocumentChunk, float]],
-                          query: str) -> str:
-        """
-        Context Compression / Prompt Compression:
-        Strip out irrelevant tokens to save costs and reduce latency.
-        
-        Also implements Lost in the Middle Mitigation:
-        Places most relevant content at the beginning and end of the context.
-        """
-        if not chunks:
-            return ""
-        
-        # Sort by relevance
-        sorted_chunks = sorted(chunks, key=lambda x: x[1], reverse=True)
-        
-        # Lost in the Middle Mitigation:
-        # Place best content at start and end, weaker in middle
-        if len(sorted_chunks) > 2:
-            reordered = []
-            for i, item in enumerate(sorted_chunks):
-                if i % 2 == 0:
-                    reordered.insert(0, item)
-                else:
-                    reordered.append(item)
-            sorted_chunks = reordered
-        
-        # Build context within token limit
-        context_parts = []
-        token_count = 0
-        
-        for chunk, score in sorted_chunks:
-            chunk_tokens = self.estimate_tokens(chunk.content)
-            if token_count + chunk_tokens > self.max_tokens * 0.8:  # Leave room for prompt
+
+    def compress_context(
+        self,
+        results: Sequence[Tuple[DocumentChunk, float]],
+        query: str,
+        graph_context: str = "",
+    ) -> str:
+        budget_chars = max(1000, self.max_tokens * 4)
+        ordered = self._lost_in_middle_order(list(results))
+        sections = []
+        if graph_context:
+            sections.append(graph_context[: min(1500, budget_chars)])
+        for idx, (chunk, score) in enumerate(ordered, start=1):
+            source = chunk.source_file or chunk.metadata.get("file_path", "memory")
+            sections.append(
+                f"[{idx}] source={source} score={score:.4f} chunk={chunk.chunk_id}\n"
+                f"{chunk.content.strip()}"
+            )
+
+        compressed = "\n\n".join(sections)
+        if len(compressed) <= budget_chars:
+            return compressed
+
+        query_terms = set(_tokens(query))
+        sentences = re.split(r"(?<=[.!?])\s+", compressed)
+        kept = []
+        used = 0
+        for sentence in sentences:
+            sentence_score = len(query_terms & set(_tokens(sentence)))
+            if sentence_score == 0 and used > budget_chars * 0.6:
+                continue
+            next_len = len(sentence) + 1
+            if used + next_len > budget_chars:
                 break
-            context_parts.append(f"[Relevance: {score:.3f}] {chunk.content}")
-            token_count += chunk_tokens
-        
-        return "\n\n---\n\n".join(context_parts)
-    
-    def truncate_to_window(self, text: str) -> str:
-        """Truncate text to fit within context window."""
-        estimated = self.estimate_tokens(text)
-        if estimated <= self.max_tokens:
-            return text
-        
-        max_chars = self.max_tokens * 4
-        return text[:max_chars] + "\n...[truncated]"
+            kept.append(sentence)
+            used += next_len
+        return " ".join(kept)
+
+    def _lost_in_middle_order(
+        self, results: List[Tuple[DocumentChunk, float]]
+    ) -> List[Tuple[DocumentChunk, float]]:
+        if len(results) <= 2:
+            return results
+        sorted_results = sorted(results, key=lambda item: item[1], reverse=True)
+        reordered: List[Tuple[DocumentChunk, float]] = []
+        left = True
+        for item in sorted_results:
+            if left:
+                reordered.insert(0, item)
+            else:
+                reordered.append(item)
+            left = not left
+        return reordered
 
 
-# ─────────────────────────────────────────────
-# Factory
-# ─────────────────────────────────────────────
+def _normalize(results: Sequence[Tuple[DocumentChunk, float]]) -> List[Tuple[DocumentChunk, float]]:
+    if not results:
+        return []
+    max_score = max(score for _, score in results) or 1.0
+    return [(chunk, score / max_score) for chunk, score in results]
 
-def create_retrieval_engine(config=None):
-    """Create the full retrieval engine with all components."""
-    from config import RAGConfig
-    
-    cfg = config or RAGConfig()
-    
-    # Embeddings
-    embedding_engine = EmbeddingEngine(
-        model_name=cfg.data_engineering.embedding_model,
-        dimension=cfg.data_engineering.embedding_dimension,
-    )
-    
-    # Vector Store
-    vector_store = VectorStore(
-        embedding_engine=embedding_engine,
-        persist_dir=cfg.retrieval.vector_db_persist_dir,
-    )
-    
-    # BM25
-    bm25 = BM25Retriever()
-    
-    # Re-ranker
-    reranker = ReRanker(model_type=cfg.retrieval.reranking_model)
-    
-    # Hybrid Search
-    hybrid_search = HybridSearchEngine(
-        vector_store=vector_store,
-        bm25=bm25,
-        reranker=reranker,
-        bm25_weight=cfg.retrieval.bm25_weight,
-        semantic_weight=cfg.retrieval.semantic_weight,
-    )
-    
-    # Semantic Router
-    semantic_router = SemanticRouter(embedding_engine)
-    
-    # Knowledge Graph (Graph RAG)
-    knowledge_graph = KnowledgeGraph()
-    
-    # Context Window Manager
-    context_manager = ContextWindowManager(max_tokens=cfg.retrieval.context_window_limit)
-    
-    return {
-        "embedding_engine": embedding_engine,
-        "vector_store": vector_store,
-        "bm25": bm25,
-        "reranker": reranker,
-        "hybrid_search": hybrid_search,
-        "semantic_router": semantic_router,
-        "knowledge_graph": knowledge_graph,
-        "context_manager": context_manager,
-    }
+
+def _dedupe_and_sort(
+    results: Sequence[Tuple[DocumentChunk, float]],
+    top_k: int,
+) -> List[Tuple[DocumentChunk, float]]:
+    best: Dict[str, Tuple[DocumentChunk, float]] = {}
+    for chunk, score in results:
+        current = best.get(chunk.chunk_id)
+        if current is None or score > current[1]:
+            best[chunk.chunk_id] = (chunk, score)
+    return sorted(best.values(), key=lambda item: item[1], reverse=True)[:top_k]
+
+
+# Compatibility helpers retained for the original scaffold API.
+def process_documents(documents: Sequence[Any]) -> List[DocumentChunk]:
+    """Chunk LangChain-style documents or plain strings into DocumentChunk objects."""
+
+    chunker = ChunkingEngine(chunk_size=1000, chunk_overlap=200, strategy="recursive")
+    chunks: List[DocumentChunk] = []
+    for idx, document in enumerate(documents):
+        content = getattr(document, "page_content", str(document))
+        metadata = dict(getattr(document, "metadata", {}) or {})
+        source = metadata.get("source", f"document_{idx}")
+        chunks.extend(chunker.chunk(content, source_file=source, metadata=metadata))
+    return chunks
+
+
+def build_hybrid_retriever(chunks: Sequence[DocumentChunk], embeddings: Any = None) -> HybridSearchEngine:
+    """Build the project-level hybrid search engine."""
+
+    engine = embeddings if isinstance(embeddings, EmbeddingEngine) else EmbeddingEngine()
+    return HybridSearchEngine.from_chunks(chunks, embedding_engine=engine)
+
+
+def apply_metadata_filtering(query: str, user_clearance: int) -> Dict[str, Dict[str, int]]:
+    """Return a vector-store-compatible RBAC metadata filter."""
+
+    return {"security_clearance": {"$lte": user_clearance}}

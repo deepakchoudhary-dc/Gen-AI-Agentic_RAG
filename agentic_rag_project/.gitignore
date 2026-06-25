@@ -7,3 +7,8 @@ logs/
 _pytest_cache/
 __pycache__/
 *.pyc
+
+.runlogs/
+.venv/
+data/
+*.md

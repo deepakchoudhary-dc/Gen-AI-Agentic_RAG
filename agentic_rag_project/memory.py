@@ -212,7 +212,24 @@ class PersistenceLayer:
     
     def _init_db(self):
         """Initialize the SQLite database."""
-        conn = sqlite3.connect(self.db_path)
+        try:
+            conn = self._connect()
+            self._create_schema(conn)
+        except sqlite3.OperationalError as exc:
+            if not self._recover_sqlite_startup_failure(exc):
+                raise
+            conn = self._connect()
+            self._create_schema(conn)
+        logger.info(f"Persistence Layer: Initialized at {self.db_path}")
+
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _create_schema(self, conn):
+        """Create persistence tables and indexes."""
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -244,12 +261,49 @@ class PersistenceLayer:
         
         conn.commit()
         conn.close()
-        logger.info(f"Persistence Layer: Initialized at {self.db_path}")
+
+    def _recover_sqlite_startup_failure(self, exc: sqlite3.OperationalError) -> bool:
+        """
+        Recover from stale local SQLite artifacts.
+
+        This is intentionally narrow: it handles startup failures caused by
+        half-created local files or orphaned journal/WAL files, which are common
+        after interrupted test runs on Windows.
+        """
+        message = str(exc).lower()
+        recoverable = any(
+            marker in message
+            for marker in ["disk i/o error", "database disk image is malformed", "file is not a database"]
+        )
+        if not recoverable:
+            return False
+
+        stamp = int(time.time() * 1000)
+        for suffix in ["", "-journal", "-wal", "-shm"]:
+            path = f"{self.db_path}{suffix}"
+            if not os.path.exists(path):
+                continue
+            backup = f"{path}.corrupt-{stamp}"
+            try:
+                os.replace(path, backup)
+                logger.warning(f"Recovered stale SQLite artifact: {path} -> {backup}")
+            except OSError as backup_error:
+                fallback = f"{self.db_path}.recovered-{stamp}.db"
+                logger.warning(
+                    "Could not rename stale SQLite artifact %s: %s. "
+                    "Using fallback database %s.",
+                    path,
+                    backup_error,
+                    fallback,
+                )
+                self.db_path = fallback
+                return True
+        return True
     
     def save_state(self, thread_id: str, step_index: int,
                     state: Dict, node_name: str = ""):
         """Save an agent state checkpoint."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -272,7 +326,7 @@ class PersistenceLayer:
         Retrieve a state checkpoint.
         If step_index is -1, returns the latest state.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         if step_index == -1:
@@ -304,7 +358,7 @@ class PersistenceLayer:
         if state:
             logger.info(f"Time-Travel: Rewound thread '{thread_id}' to step {target_step}")
             # Delete all states after the target step
-            conn = sqlite3.connect(self.db_path)
+            conn = self._connect()
             cursor = conn.cursor()
             cursor.execute("""
                 DELETE FROM agent_states
@@ -319,7 +373,7 @@ class PersistenceLayer:
     
     def list_checkpoints(self, thread_id: str) -> List[Dict]:
         """List all checkpoints for a thread (for time-travel UI)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -344,7 +398,7 @@ class PersistenceLayer:
     def save_session(self, session_id: str, thread_id: str,
                       user_id: str, conversation: Dict):
         """Save a conversation session."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         now = datetime.now().isoformat()
         
@@ -363,7 +417,7 @@ class PersistenceLayer:
     
     def load_session(self, session_id: str) -> Optional[Dict]:
         """Load a conversation session."""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         
         cursor.execute("""

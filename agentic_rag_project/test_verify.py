@@ -7,6 +7,7 @@ import time
 import os
 import importlib
 import traceback
+import shutil
 
 # Ensure project directory is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -15,6 +16,18 @@ PASSED = 0
 FAILED = 0
 PARTIAL = 0
 results = []
+
+def safe_remove(path):
+    """Best-effort cleanup for restricted Windows sandboxes."""
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        elif os.path.isfile(path):
+            os.remove(path)
+    except PermissionError:
+        pass
+    except OSError:
+        pass
 
 def check(name, passed, detail=""):
     global PASSED, FAILED, PARTIAL
@@ -45,7 +58,7 @@ section("1. Syntax & Module Import Verification")
 
 modules_to_check = [
     "config", "llm_provider", "security", "ingestion",
-    "retrieval", "memory", "tools", "eval", "agent",
+    "retrieval", "memory", "tools", "eval", "agent", "streamlit_app",
 ]
 
 for mod_name in modules_to_check:
@@ -287,7 +300,7 @@ try:
     check("MultiModalIngestor functional", len(doc.chunks) > 0)
     
     # Cleanup
-    os.remove(test_file)
+    safe_remove(test_file)
     
 except Exception as e:
     check("Ingestion module", False, traceback.format_exc())
@@ -483,6 +496,7 @@ try:
     check("Ollama provider support", "_init_ollama" in llm_source)
     check("OpenAI provider support", "_init_openai" in llm_source)
     check("Anthropic provider support", "_init_anthropic" in llm_source)
+    check("Google Gemini provider support", "_init_gemini" in llm_source)
     check("Custom API provider support", "_init_custom" in llm_source)
     check("Streaming support", "def stream" in llm_source)
     
@@ -495,6 +509,27 @@ try:
     
 except Exception as e:
     check("LLM Provider", False, traceback.format_exc())
+
+# ─────────────────────────────────────────────────────────────
+# 10B. STREAMLIT WEB APPLICATION
+# ─────────────────────────────────────────────────────────────
+section("10B. Streamlit Web Interface")
+
+try:
+    web_source = open("streamlit_app.py", encoding="utf-8").read()
+    reqs = open("requirements.txt", encoding="utf-8").read()
+    check("Streamlit dependency", "streamlit" in reqs)
+    check("Gemini dependency", "langchain-google-genai" in reqs)
+    check("Web app provider panel", "provider_config_panel" in web_source)
+    check("Gemini API key only when selected", "Google Gemini API key" in web_source)
+    check("File uploader", "file_uploader" in web_source)
+    check("Upload ingestion", "ingest_uploaded_documents" in web_source)
+    check("Chat interface", "chat_input" in web_source and "chat_message" in web_source)
+    check("Status dashboard in web", "render_status" in web_source)
+    check("Benchmark in web", "GoldenDataset" in web_source)
+    check("Security/tools/traces in web", "critical_hitl_actions" in web_source and "get_tools_description" in web_source)
+except Exception as e:
+    check("Streamlit web interface", False, traceback.format_exc())
 
 # ────────────────────────────────────────
 # 11. TOOLS / FUNCTION CALLING
@@ -572,13 +607,6 @@ print(f"  SCORE:   {PASSED}/{PASSED + PARTIAL + FAILED} ({100*PASSED/(PASSED+PAR
 print("=" * 60)
 
 # Cleanup test artifacts
-import shutil
 for path in ["data/test_vectordb", "data/test_traces", "data/test_ltm.json", 
              "data/test_state.db", "data/test_golden.json"]:
-    try:
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        elif os.path.isfile(path):
-            os.remove(path)
-    except:
-        pass
+    safe_remove(path)

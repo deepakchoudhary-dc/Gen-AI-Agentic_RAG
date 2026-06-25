@@ -3,7 +3,7 @@ LLM Provider Module
 
 Implements:
   - Ollama local model detection and usage (Air-Gapped Deployment)
-  - External API support (OpenAI, Anthropic, custom endpoints)
+  - External API support (OpenAI, Anthropic, Gemini, custom endpoints)
   - Model configuration and initialization
   - Streaming Outputs support
   - Speculative Decoding awareness
@@ -13,6 +13,7 @@ import os
 import subprocess
 import json
 import logging
+import urllib.request
 from typing import List, Dict, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,25 @@ def detect_ollama_models() -> List[Dict[str, str]]:
     Detect locally downloaded Ollama models.
     Air-Gapped Deployment: Supports fully local operation.
     """
+    # Prefer the Ollama HTTP API because it returns structured JSON and avoids
+    # brittle parsing of columns such as size and modified date.
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3) as response:
+            if response.status == 200:
+                payload = json.loads(response.read().decode("utf-8"))
+                models = []
+                for item in payload.get("models", []):
+                    models.append({
+                        "name": item.get("name", ""),
+                        "id": item.get("digest", ""),
+                        "size": str(item.get("size", "")),
+                        "modified_at": item.get("modified_at", ""),
+                    })
+                if models:
+                    return models
+    except Exception:
+        pass
+
     try:
         result = subprocess.run(
             ["ollama", "list"],
@@ -41,7 +61,9 @@ def detect_ollama_models() -> List[Dict[str, str]]:
         if len(lines) <= 1:
             return []
         
-        # Skip header line
+        # Skip header line. Ollama names cannot contain whitespace, so the
+        # first token remains a safe model identifier even though later columns
+        # include human-readable dates.
         for line in lines[1:]:
             if line.strip():
                 parts = line.split()
@@ -49,7 +71,7 @@ def detect_ollama_models() -> List[Dict[str, str]]:
                     model_info = {
                         "name": parts[0],
                         "id": parts[1] if len(parts) > 1 else "",
-                        "size": parts[2] if len(parts) > 2 else "",
+                        "size": " ".join(parts[2:4]) if len(parts) > 3 else (parts[2] if len(parts) > 2 else ""),
                     }
                     models.append(model_info)
         
@@ -96,7 +118,7 @@ class LLMProvider:
     def __init__(self, provider_type: str, model_name: str,
                  api_key: str = "", api_base_url: str = "",
                  temperature: float = 0.2, max_tokens: int = 2048):
-        self.provider_type = provider_type
+        self.provider_type = self._normalize_provider(provider_type)
         self.model_name = model_name
         self.api_key = api_key
         self.api_base_url = api_base_url
@@ -104,6 +126,59 @@ class LLMProvider:
         self.max_tokens = max_tokens
         self._llm = None
         self._init_provider()
+
+    @classmethod
+    def from_config(cls, config: Any) -> "LLMProvider":
+        """Create a provider from config.LLMConfig or a RAGConfig."""
+        llm_config = getattr(config, "llm", config)
+        provider_type = cls._normalize_provider(getattr(llm_config, "provider_type", "ollama"))
+        air_gapped = bool(getattr(llm_config, "air_gapped_mode", provider_type == "ollama"))
+        if air_gapped and provider_type != "ollama":
+            raise ValueError("air_gapped_mode=True only allows the local Ollama provider")
+
+        api_key = getattr(llm_config, "api_key", "") or cls._env_api_key(provider_type)
+        api_base_url = getattr(llm_config, "api_base_url", "")
+        if provider_type == "custom" and not api_base_url:
+            raise ValueError("custom provider requires api_base_url")
+        if provider_type in {"openai", "anthropic", "gemini"} and not api_key:
+            raise ValueError(f"{provider_type} provider requires an API key or environment variable")
+
+        return cls(
+            provider_type=provider_type,
+            model_name=getattr(llm_config, "model_name", "llama3"),
+            api_key=api_key,
+            api_base_url=api_base_url,
+            temperature=getattr(llm_config, "temperature", 0.2),
+            max_tokens=getattr(llm_config, "max_tokens", 2048),
+        )
+
+    @staticmethod
+    def _normalize_provider(provider_type: str) -> str:
+        value = (provider_type or "ollama").strip().lower()
+        aliases = {
+            "local": "ollama",
+            "ollama": "ollama",
+            "openai": "openai",
+            "anthropic": "anthropic",
+            "claude": "anthropic",
+            "google": "gemini",
+            "google_gemini": "gemini",
+            "gemini": "gemini",
+            "other": "custom",
+            "external": "custom",
+            "custom": "custom",
+        }
+        return aliases.get(value, value)
+
+    @staticmethod
+    def _env_api_key(provider_type: str) -> str:
+        if provider_type == "openai":
+            return os.getenv("OPENAI_API_KEY", "")
+        if provider_type == "anthropic":
+            return os.getenv("ANTHROPIC_API_KEY", "")
+        if provider_type == "gemini":
+            return os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+        return os.getenv("OPENAI_API_KEY", "")
     
     def _init_provider(self):
         """Initialize the LLM provider based on type."""
@@ -113,6 +188,8 @@ class LLMProvider:
             self._init_openai()
         elif self.provider_type == "anthropic":
             self._init_anthropic()
+        elif self.provider_type == "gemini":
+            self._init_gemini()
         elif self.provider_type == "custom":
             self._init_custom()
         else:
@@ -174,6 +251,25 @@ class LLMProvider:
             logger.info(f"Initialized Anthropic LLM: {self.model_name}")
         except ImportError:
             logger.error("langchain-anthropic not installed. Install with: pip install langchain-anthropic")
+            self._llm = None
+
+    def _init_gemini(self):
+        """Initialize Google Gemini model."""
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+
+            os.environ["GOOGLE_API_KEY"] = self.api_key
+            self._llm = ChatGoogleGenerativeAI(
+                model=self.model_name,
+                temperature=self.temperature,
+                max_output_tokens=self.max_tokens,
+                google_api_key=self.api_key,
+            )
+            logger.info(f"Initialized Gemini LLM: {self.model_name}")
+        except ImportError:
+            logger.error(
+                "langchain-google-genai not installed. Install with: pip install langchain-google-genai"
+            )
             self._llm = None
     
     def _init_custom(self):
