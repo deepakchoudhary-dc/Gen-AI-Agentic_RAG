@@ -21,36 +21,7 @@ The project explicitly covers these required terms in code and documentation: ag
 
 ## Run
 
-Use Python 3.10. From this machine, the C-drive interpreter is:
-
-```powershell
-C:\Users\mrrr7\AppData\Local\Programs\Python\Python310\python.exe
-```
-
-Install dependencies:
-
-```powershell
-cd E:\xelron\agentic_rag_project
-C:\Users\mrrr7\AppData\Local\Programs\Python\Python310\python.exe -m pip install -r requirements.txt
-```
-
-Start the project:
-
-```powershell
-cd E:\xelron\agentic_rag_project
-C:\Users\mrrr7\AppData\Local\Programs\Python\Python310\python.exe main.py
-```
-
 At startup, the app asks whether to use a locally downloaded Ollama model. If models are found, it lists them and lets you pick one. If not, it offers external provider setup.
-
-## Web Interface
-
-Start the Streamlit interface:
-
-```powershell
-cd E:\xelron\agentic_rag_project
-C:\Users\mrrr7\AppData\Local\Programs\Python\Python310\python.exe -m streamlit run streamlit_app.py
-```
 
 The sidebar lets the user choose:
 
@@ -76,12 +47,5 @@ The upload panel accepts text, Markdown, CSV, JSON, HTML, PDF, DOCX, and image f
 - `quit`: save state and exit
 
 ## Verify
-
-Run the full implementation check:
-
-```powershell
-cd E:\xelron\agentic_rag_project
-C:\Users\mrrr7\AppData\Local\Programs\Python\Python310\python.exe test_verify.py
-```
 
 Current verification result: `158/158` passed.
